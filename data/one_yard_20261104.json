@@ -1,0 +1,41 @@
+{
+ "one_yard_markets": 16856,
+ "one_yard_markets_traded": 860,
+ "sampled": 3360,
+ "strikes": 2047,
+ "games": 14,
+ "player_games": 28,
+ "with_bid": 2,
+ "with_ask": 2047,
+ "empty": 0,
+ "asks": {
+  "0.99": 2047
+ },
+ "curve_where_asked": [
+  0.034537863529411766,
+  0.9289662682352942
+ ],
+ "ask_below_forced_floor": 0,
+ "bids": [
+  {
+   "player": "Josh Allen",
+   "yards": 220,
+   "bid": 0.09,
+   "ask": 0.99,
+   "curve": 0.6844933333333334
+  },
+  {
+   "player": "Sam Darnold",
+   "yards": 210,
+   "bid": 0.1,
+   "ask": 0.99,
+   "curve": 0.67236
+  }
+ ],
+ "crossed_curves": 0,
+ "hit_rate": 0.37225207620908646,
+ "brier": {
+  "curve": 0.1856331894440758,
+  "line": 0.18549970102589156
+ }
+}
