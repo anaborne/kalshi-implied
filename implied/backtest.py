@@ -10,8 +10,11 @@ cheap answer) and the hidden market's own mid (what the book itself said, the ba
 
 Kickoff is taken as occurrence_datetime minus three hours. On the 2,309 passing-yards markets
 settled from Sep 1 to Nov 3 2026, that lands every one on a real slot (Sun 13:00, 16:05, 16:25,
-20:20; Mon and Thu 20:15; Wed 20:20 and Thu 20:35 in week 1; Sun 09:30). The snapshot is ten
-minutes before kickoff; markets listed after it are in-game listings and are dropped.
+20:20; Mon and Thu 20:15; Wed 20:20 and Thu 20:35 in week 1; Sun 09:30). The same holds for
+every receiving-yards and rushing-yards market settled Yes or No through Nov 10; the 13 on those
+two series with an occurrence time off any slot all settled neither way and are dropped for
+that. The snapshot is ten minutes before kickoff; markets listed after it are in-game listings
+and are dropped.
 """
 
 import json
@@ -20,6 +23,7 @@ import random
 from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from statistics import median
 
 from . import kalshi
 from .dist import Bound, Curve
@@ -36,6 +40,16 @@ def snapshot_time(m):
     return _ts(m["occurrence_datetime"]) - timedelta(hours=3, minutes=10)
 
 
+def quote_key(m):
+    """Ticker, snapshot time and candle period: what one pregame quote is cached under."""
+    return f"{m['ticker']}@{int(snapshot_time(m).timestamp())}-p1"
+
+
+def _last_close(candles, snap):
+    cs = [c for c in candles if c["end_period_ts"] <= snap]
+    return cs and kalshi.parse_quote(cs[-1]["yes_bid"].get("close_dollars"), cs[-1]["yes_ask"].get("close_dollars"))
+
+
 def pregame_quote(series, m):
     """(bid, ask) at the snapshot; cached by ticker, snapshot time and candle period. A market
     listed at or after its snapshot has no pregame book; it returns (None, None) and is not cached.
@@ -46,7 +60,7 @@ def pregame_quote(series, m):
     """
     snap = int(snapshot_time(m).timestamp())
     os.makedirs(CACHE, exist_ok=True)
-    path = os.path.join(CACHE, f"{m['ticker']}@{snap}-p1.json")
+    path = os.path.join(CACHE, quote_key(m) + ".json")
     if os.path.exists(path):
         with open(path) as f:
             return tuple(json.load(f))
@@ -55,9 +69,9 @@ def pregame_quote(series, m):
         return q
     while end > opened:
         start = max(opened, end - 72 * 3600)
-        cs = [c for c in kalshi.candles(series, m["ticker"], start, end, period=1) if c["end_period_ts"] <= snap]
-        if cs:
-            q = kalshi.parse_quote(cs[-1]["yes_bid"].get("close_dollars"), cs[-1]["yes_ask"].get("close_dollars"))
+        found = _last_close(kalshi.candles(series, m["ticker"], start, end, period=1), snap)
+        if found:
+            q = found
             break
         end = start
     with open(path, "w") as f:
@@ -65,21 +79,57 @@ def pregame_quote(series, m):
     return q
 
 
-def player_games(series, settled, min_rows=4, two_sided=True):
-    """[(event, player, [(strike, bid, ask, result)])] with two-sided pregame quotes only, or with
-    every pregame quote when `two_sided` is False."""
-    groups = {}
+def pregame_markets(settled):
+    """The threshold markets that settled Yes or No and were listed before their snapshot."""
     for m in settled:
         if m.get("strike_type") != "greater" or m.get("result") not in ("yes", "no"):
             continue
         if _ts(m["open_time"]) >= snapshot_time(m):
             continue
+        yield m
+
+
+def fetch_quotes(series, settled, per_request=40):
+    """({quote_key: [bid, ask]}, [keys the batch endpoint had nothing for]) covering every market
+    player_games reads, through the batch candlestick endpoint: one request per 40 markets
+    sharing a snapshot, where pregame_quote makes at least one per market. Receiving and rushing
+    list about 20,000 such markets against passing's 2,100.
+
+    The window is the two hours before the snapshot. An older book arrives as the candle the
+    endpoint stamps at the window's start, so no stepping back is needed. A market the endpoint
+    returns nothing for goes through pregame_quote's search instead and is named in the second
+    value, so a comparison of the two paths can leave it out.
+    """
+    by_snap = {}
+    for m in pregame_markets(settled):
+        by_snap.setdefault(int(snapshot_time(m).timestamp()), []).append(m)
+    out, searched = {}, []
+    for snap, ms in sorted(by_snap.items()):
+        for i in range(0, len(ms), per_request):
+            chunk = ms[i:i + per_request]
+            got = kalshi.batch_candles([m["ticker"] for m in chunk], snap - 2 * 3600, snap, period=1)
+            for m in chunk:
+                q = _last_close(got.get(m["ticker"], []), snap)
+                if not q:
+                    searched.append(quote_key(m))
+                    q = pregame_quote(series, m)
+                out[quote_key(m)] = list(q)
+    return out, searched
+
+
+def player_games(series, settled, min_rows=4, two_sided=True, quotes=None):
+    """[(event, player, [(strike, bid, ask, result)])] with two-sided pregame quotes only, or with
+    every pregame quote when `two_sided` is False. `quotes` is a fetch_quotes mapping; a market
+    missing from it is read through pregame_quote."""
+    groups = {}
+    for m in pregame_markets(settled):
         groups.setdefault((m["event_ticker"], player_of(m)), []).append(m)
     out = []
     for (event, player), ms in sorted(groups.items()):
         rows = []
         for m in ms:
-            bid, ask = pregame_quote(series, m)
+            q = (quotes or {}).get(quote_key(m))
+            bid, ask = q if q is not None else pregame_quote(series, m)
             if not two_sided or (bid is not None and ask is not None and bid < ask):
                 rows.append((float(m["floor_strike"]), bid, ask, m["result"] == "yes"))
         rows.sort()
@@ -110,6 +160,31 @@ def holdout(games):
                 "gaps": (t - rows[j - 1][0], rows[j + 1][0] - t),
             })
     return recs
+
+
+def extrapolation(games):
+    """What the curve does outside the quoted strikes, which holdout never tests. The lowest and
+    the highest two-sided strike of each ladder are hidden in turn and read off the tail fitted to
+    the rest. `below_zero` is the mass the whole ladder's lower tail puts under zero yards. A
+    ladder with no fitted tail has no estimate and is counted in `no_tail`."""
+    mean = lambda xs: sum(xs) / len(xs) if xs else None
+    out = {"ladders": len(games)}
+    for name, j in (("lowest", 0), ("highest", -1)):
+        errs, inside = [], []
+        for _, _, rows in games:
+            t, bid, ask, _ = rows[j]
+            p = Curve([Bound(k, b, a) for k, b, a, _ in (rows[1:] if j == 0 else rows[:-1])]).point(t)
+            if p is not None:
+                errs.append(p - (bid + ask) / 2)
+                inside.append(bid <= p <= ask)
+        out[name] = {"n": len(errs), "no_tail": len(games) - len(errs), "mean_abs_gap": mean([abs(e) for e in errs]),
+                     "mean_signed_gap": mean(errs), "inside_quote": mean(inside)}
+    out["median_mid_at_lowest_strike"] = median([(rows[0][1] + rows[0][2]) / 2 for _, _, rows in games]) if games else None
+    below = [1 - p for p in (Curve([Bound(k, b, a) for k, b, a, _ in rows]).point(-0.5) for _, _, rows in games)
+             if p is not None]
+    out["below_zero"] = {"n": len(below), "mean": mean(below), "median": median(below) if below else None,
+                         "max": max(below, default=None), "over_1c": mean([x > 0.01 for x in below])}
+    return out
 
 
 def one_yard_sample(precise_settled):

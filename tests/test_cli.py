@@ -373,6 +373,12 @@ class TestNflCommand(unittest.TestCase):
         lo, p, hi = c.range(229.5, 260.5)
         self.assertIn(f"230-260 yds  floor {lo:5.3f}  fair {p:5.3f}  ceiling {hi:5.3f}  pays {1 / p:.2f}x at fair", out)
 
+    def test_a_range_reaching_past_the_two_sided_strikes_is_marked(self):
+        mark = "reaches outside the two-sided strikes (200+ to 275+)"
+        with mock.patch.object(kalshi, "markets", return_value=self.ms()):
+            for low, high, marked in ((230, 260, False), (200, 274, False), (199, 260, True), (230, 275, True), (0, 210, True)):
+                self.assertEqual(mark in run("nfl", "E", "--player", "Q B", "--range", str(low), str(high)), marked, (low, high))
+
     def test_range_and_ladder_views(self):
         with mock.patch.object(kalshi, "markets", return_value=self.ms()):
             out = run("nfl", "E", "--player", "Q B", "--range", "230", "260")
@@ -417,6 +423,63 @@ class TestBacktestCommand(unittest.TestCase):
             os.unlink(f.name)
         self.assertEqual(out["score"]["n"], 2)
         self.assertIn("gap_curve_minus_line", out["bootstrap"])
+
+
+class TestShippedSeries(unittest.TestCase):
+    ROWS = [(149.5, 0.80, 0.84, True), (174.5, 0.65, 0.70, True), (199.5, 0.48, 0.52, False), (224.5, 0.30, 0.34, False)]
+
+    def loads(self):
+        """_load answering by file name: quotes files hold one entry naming themselves."""
+        return mock.patch.object(cli, "_load", side_effect=lambda p: {"from": os.path.basename(p)} if "quotes" in p else [])
+
+    def test_each_series_reads_its_own_settled_file_and_quotes(self):
+        want = {"KXNFLPASSYDS": ("passyds_settled_20261104.json", None),
+                "KXNFLRECYDS": ("recyds_settled_20261110.json", {"from": "recyds_quotes_20261110.json"}),
+                "KXNFLRSHYDS": ("rshyds_settled_20261110.json", {"from": "rshyds_quotes_20261110.json"})}
+        self.assertEqual(set(cli.SHIPPED), set(want))
+        for series, (settled, quotes) in want.items():
+            with self.loads() as load, mock.patch("implied.backtest.player_games", return_value=[("E", "Q", self.ROWS)]) as pg:
+                run("backtest", "--series", series)
+            self.assertEqual(load.call_args_list[0].args[0], os.path.join(cli.REPO, "data", settled))
+            self.assertEqual((pg.call_args.args[0], pg.call_args.kwargs), (series, {"quotes": quotes}))
+
+    def test_given_files_replace_the_shipped_ones(self):
+        with self.loads() as load, mock.patch("implied.backtest.player_games", return_value=[("E", "Q", self.ROWS)]) as pg:
+            run("backtest", "--series", "KXNFLRECYDS", "--settled", "/x/s.json", "--quotes", "/x/my_quotes.json")
+        self.assertEqual([c.args[0] for c in load.call_args_list], ["/x/s.json", "/x/my_quotes.json"])
+        self.assertEqual(pg.call_args.kwargs, {"quotes": {"from": "my_quotes.json"}})
+
+    def test_a_series_that_does_not_ship_needs_a_settled_file(self):
+        with self.loads(), self.assertRaises(SystemExit) as e:
+            run("backtest", "--series", "KXNFLTD")
+        self.assertIn("--settled", str(e.exception))
+        with self.loads(), mock.patch("implied.backtest.player_games", return_value=[("E", "Q", self.ROWS)]) as pg:
+            run("backtest", "--series", "KXNFLTD", "--settled", "/x/s.json")
+        self.assertEqual(pg.call_args.kwargs, {"quotes": None})
+
+    def test_extrapolate_covers_every_shipped_series(self):
+        with self.loads(), mock.patch("implied.backtest.player_games", return_value=[("E", "Q", self.ROWS)]) as pg:
+            out = json.loads(run("extrapolate"))
+        self.assertEqual(list(out), list(cli.SHIPPED))
+        self.assertEqual(out["KXNFLRECYDS"]["ladders"], 1)
+        self.assertEqual([(c.args[0], c.kwargs["quotes"]) for c in pg.call_args_list],
+                         [("KXNFLPASSYDS", None), ("KXNFLRECYDS", {"from": "recyds_quotes_20261110.json"}),
+                          ("KXNFLRSHYDS", {"from": "rshyds_quotes_20261110.json"})])
+
+    def test_fetch_quotes_writes_one_file_and_counts_agreement_with_the_single_market_cache(self):
+        # B went through the single-market search, so its agreement with the cache proves nothing.
+        fetched = {"A@1-p1": [0.1, 0.2], "B@1-p1": [None, 0.5], "C@1-p1": [0.3, 0.4], "D@1-p1": [0.6, 0.7]}
+        with tempfile.TemporaryDirectory() as d, mock.patch("implied.backtest.CACHE", d), \
+             mock.patch("implied.backtest.fetch_quotes", return_value=(fetched, ["B@1-p1"])) as fq:
+            cli._write(os.path.join(d, "A@1-p1.json"), [0.1, 0.2])
+            cli._write(os.path.join(d, "B@1-p1.json"), [None, 0.5])
+            cli._write(os.path.join(d, "D@1-p1.json"), [0.6, 0.8])
+            cli._write(os.path.join(d, "s.json"), [{"ticker": "A"}])
+            out = run("fetch-quotes", "--series", "S", "--settled", os.path.join(d, "s.json"), "--out", os.path.join(d, "q.json"))
+            self.assertEqual(cli._load(os.path.join(d, "q.json")), fetched)
+        fq.assert_called_once_with("S", [{"ticker": "A"}])
+        self.assertIn("4 pregame quotes for S", out)
+        self.assertIn("1 came from the single-market search; of the rest, 1 of the 2 that data/nfl also holds are identical", out)
 
 
 class TestOneYardCommand(unittest.TestCase):

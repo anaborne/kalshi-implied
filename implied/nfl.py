@@ -3,7 +3,8 @@
 Kalshi lists passing yards as a 25-yard ladder (KXNFLPASSYDS: 250+, 275+, ...) with two-sided
 books, and as a one-yard ladder (KXNFLPASSYDSPRECISE, "Pass Yards Precise": 0+ to 601+) whose
 pregame books carried no bids in this repo's sample. A whole-yard range [a, b] is
-S(a - 0.5) - S(b + 0.5) on one curve, fitted here to the 25-yard ladder.
+S(a - 0.5) - S(b + 0.5) on one curve, fitted here to the 25-yard ladder. Receiving and rushing
+yards (KXNFLRECYDS, KXNFLRSHYDS) are threshold ladders too and go through the same functions.
 """
 
 from .dist import Bound, Curve

@@ -160,6 +160,69 @@ class TestPregameQuote(unittest.TestCase):
                 self.assertEqual(backtest.pregame_quote("S", self.m), (None, None))
 
 
+class TestBatchQuotes(unittest.TestCase):
+    SNAP = 1793555400
+
+    def market(self, ticker, **over):
+        return dict({"ticker": ticker, "strike_type": "greater", "result": "yes", "open_time": "2026-10-24T09:50:00Z",
+                     "occurrence_datetime": "2026-11-01T21:00:00Z"}, **over)
+
+    def candle(self, end, bid, ask):
+        return {"end_period_ts": end, "yes_bid": {"close_dollars": bid}, "yes_ask": {"close_dollars": ask}}
+
+    def test_batch_candles_request_and_shape(self):
+        body = {"markets": [{"market_ticker": "A", "candlesticks": [1, 2]}, {"market_ticker": "B"}]}
+        with mock.patch.object(kalshi, "get", return_value=body) as g:
+            self.assertEqual(kalshi.batch_candles(["A", "B"], 10.7, 20.2, period=1), {"A": [1, 2], "B": []})
+        g.assert_called_once_with("/markets/candlesticks", market_tickers="A,B", start_ts=10, end_ts=20,
+                                  period_interval=1, include_latest_before_start="true")
+
+    def test_quote_key_is_the_cache_file_name(self):
+        self.assertEqual(backtest.quote_key(self.market("T1")), f"T1@{self.SNAP}-p1")
+
+    def test_reads_the_last_candle_at_or_before_the_snapshot(self):
+        got = {"A": [self.candle(self.SNAP - 7200, "0.30", "0.34"), self.candle(self.SNAP - 60, "0.31", "0.35"),
+                     self.candle(self.SNAP + 60, "0.90", "0.95")],
+               "B": [self.candle(self.SNAP - 7200, "0.0000", "0.9900")],
+               "C": [self.candle(self.SNAP, "0.50", "0.52")]}
+        ms = [self.market(t) for t in "ABC"]
+        with mock.patch.object(kalshi, "batch_candles", return_value=got) as b, mock.patch.object(backtest, "pregame_quote") as single:
+            out, searched = backtest.fetch_quotes("S", ms)
+        self.assertEqual(out, {f"A@{self.SNAP}-p1": [0.31, 0.35], f"B@{self.SNAP}-p1": [None, 0.99],
+                               f"C@{self.SNAP}-p1": [0.5, 0.52]})
+        self.assertEqual(searched, [])
+        b.assert_called_once_with(["A", "B", "C"], self.SNAP - 7200, self.SNAP, period=1)
+        single.assert_not_called()
+
+    def test_a_market_with_no_candle_by_the_snapshot_goes_through_the_single_market_search(self):
+        ms = [self.market("A"), self.market("B"), self.market("C")]
+        got = {"A": [self.candle(self.SNAP + 60, "0.90", "0.95")], "C": [self.candle(self.SNAP - 60, "0.0000", "0.0000")]}
+        with mock.patch.object(kalshi, "batch_candles", return_value=got), \
+             mock.patch.object(backtest, "pregame_quote", side_effect=[(0.2, 0.3), (None, None)]) as single:
+            out, searched = backtest.fetch_quotes("S", ms)
+        self.assertEqual(out, {f"A@{self.SNAP}-p1": [0.2, 0.3], f"B@{self.SNAP}-p1": [None, None],
+                               f"C@{self.SNAP}-p1": [None, None]})
+        self.assertEqual(searched, [f"A@{self.SNAP}-p1", f"B@{self.SNAP}-p1"])
+        self.assertEqual([c.args for c in single.call_args_list], [("S", ms[0]), ("S", ms[1])])
+
+    def test_one_request_per_40_markets_of_a_snapshot_and_none_across_snapshots(self):
+        early = [self.market(f"E{i}") for i in range(41)]
+        late = [self.market("L", occurrence_datetime="2026-11-02T01:20:00Z")]
+        with mock.patch.object(kalshi, "batch_candles", return_value={}) as b, \
+             mock.patch.object(backtest, "pregame_quote", return_value=(None, None)):
+            out, _ = backtest.fetch_quotes("S", late + early)
+        self.assertEqual(len(out), 42)
+        self.assertEqual([(len(c.args[0]), c.args[2]) for c in b.call_args_list],
+                         [(40, self.SNAP), (1, self.SNAP), (1, self.SNAP + 4 * 3600 + 1200)])
+
+    def test_only_markets_the_backtest_reads_are_fetched(self):
+        ms = [self.market("A"), self.market("scalar", result="scalar"), self.market("between", strike_type="between"),
+              self.market("in-game", open_time="2026-11-01T18:30:00Z")]
+        with mock.patch.object(kalshi, "batch_candles", return_value={"A": [self.candle(self.SNAP, "0.1", "0.2")]}) as b:
+            self.assertEqual(list(backtest.fetch_quotes("S", ms)[0]), [f"A@{self.SNAP}-p1"])
+        self.assertEqual(b.call_args.args[0], ["A"])
+
+
 class TestSpxEdges(unittest.TestCase):
     def test_fetch_chain(self):
         with mock.patch("urllib.request.urlopen", return_value=response({"data": {}})):

@@ -84,6 +84,23 @@ class TestBacktest(unittest.TestCase):
         with mock.patch.object(backtest, "pregame_quote", side_effect=lambda s, m: quotes[m["ticker"]]):
             self.assertEqual(backtest.player_games("S", ms), [])
 
+    def test_packed_quotes_are_read_before_the_single_market_cache(self):
+        ms = [market("Q", k, "0.30", "0.35", result="yes") for k in (150, 175, 200, 225)]
+        packed = {backtest.quote_key(m): [0.9 - i / 10, 0.95 - i / 10] for i, m in enumerate(ms[:3])}
+        with mock.patch.object(backtest, "pregame_quote", return_value=(0.1, 0.2)) as single:
+            [(_, _, rows)] = backtest.player_games("S", ms, quotes=packed)
+        self.assertEqual([r[1:3] for r in rows], [(0.9, 0.95), (0.8, 0.85), (0.7, 0.75), (0.1, 0.2)])
+        single.assert_called_once_with("S", ms[3])
+
+    def test_a_packed_empty_book_is_not_fetched_again(self):
+        ms = [market("Q", k, "0.30", "0.35", result="yes") for k in (150, 175, 200, 225, 250)]
+        packed = {backtest.quote_key(m): [0.9 - i / 10, 0.95 - i / 10] for i, m in enumerate(ms)}
+        packed[backtest.quote_key(ms[4])] = [None, None]
+        with mock.patch.object(backtest, "pregame_quote") as single:
+            [(_, _, rows)] = backtest.player_games("S", ms, quotes=packed)
+        self.assertEqual(len(rows), 4)
+        single.assert_not_called()
+
     def test_line_reference_interpolates_on_uneven_ladders(self):
         rows = [(149.5, 0.80, 0.80, True), (199.5, 0.40, 0.40, False)]
         self.assertAlmostEqual(backtest._linear(rows, 174.5), 0.60)
@@ -132,6 +149,57 @@ class TestBacktest(unittest.TestCase):
         rec = {"event": "E", "player": "Q", "hit": True, "curve": 0.5, "line": 0.5, "book": 0.7 - 0.4,
                "lo": 0.3, "hi": 0.6}
         self.assertEqual(backtest.score([rec])["book_mid_inside_envelope"], 1.0)
+
+    def normal_ladder(self, mu=60.0, sigma=30.0, strikes=(29.5, 39.5, 49.5, 59.5, 69.5, 79.5), bump=None):
+        """Books two cents wide around a normal's survival curve; `bump` moves one strike's mid."""
+        sf = lambda t: 1 - NormalDist(mu, sigma).cdf(t)
+        mid = lambda t: sf(t) + (bump or {}).get(t, 0.0)
+        return [(t, mid(t) - 0.01, mid(t) + 0.01, False) for t in strikes]
+
+    def test_extrapolation_hides_each_end_and_reads_it_off_the_tail_of_the_rest(self):
+        e = backtest.extrapolation([("E", "Q", self.normal_ladder())])
+        self.assertEqual((e["ladders"], e["lowest"]["n"], e["highest"]["n"], e["lowest"]["no_tail"]), (1, 1, 1, 0))
+        self.assertLess(e["lowest"]["mean_abs_gap"], 0.002)
+        self.assertLess(e["highest"]["mean_abs_gap"], 0.002)
+        self.assertEqual((e["lowest"]["inside_quote"], e["highest"]["inside_quote"]), (1.0, 1.0))
+
+    def test_extrapolation_gaps_are_signed_and_scored_against_the_hidden_book(self):
+        low = backtest.extrapolation([("E", "Q", self.normal_ladder(bump={29.5: 0.05}))])
+        self.assertAlmostEqual(low["lowest"]["mean_signed_gap"], -0.05, places=2)
+        self.assertAlmostEqual(low["lowest"]["mean_abs_gap"], 0.05, places=2)
+        self.assertEqual(low["lowest"]["inside_quote"], 0.0)
+        high = backtest.extrapolation([("E", "Q", self.normal_ladder(bump={79.5: -0.05}))])
+        self.assertAlmostEqual(high["highest"]["mean_signed_gap"], 0.05, places=2)
+        self.assertEqual(high["highest"]["inside_quote"], 0.0)
+
+    def test_extrapolation_averages_over_ladders(self):
+        e = backtest.extrapolation([("E", "Q", self.normal_ladder(bump={29.5: 0.05})), ("E", "R", self.normal_ladder())])
+        self.assertAlmostEqual(e["lowest"]["mean_abs_gap"], 0.025, places=2)
+        self.assertEqual(e["lowest"]["inside_quote"], 0.5)
+
+    def test_mass_below_zero_is_read_at_minus_half_a_yard_on_the_whole_ladder(self):
+        e = backtest.extrapolation([("E", "Q", self.normal_ladder()), ("E", "R", self.normal_ladder(mu=45.0, sigma=30.0))])
+        want = sorted(NormalDist(mu, 30.0).cdf(-0.5) for mu in (60.0, 45.0))
+        z = e["below_zero"]
+        self.assertEqual((z["n"], z["over_1c"]), (2, 1.0))
+        self.assertAlmostEqual(z["max"], want[1], places=3)
+        self.assertAlmostEqual(z["median"], sum(want) / 2, places=3)
+        self.assertAlmostEqual(z["mean"], sum(want) / 2, places=3)
+        mids = [1 - NormalDist(mu, 30.0).cdf(29.5) for mu in (60.0, 45.0)]
+        self.assertAlmostEqual(e["median_mid_at_lowest_strike"], sum(mids) / 2, places=9)
+
+    def test_over_1c_counts_only_ladders_above_a_cent(self):
+        e = backtest.extrapolation([("E", "Q", self.normal_ladder()), ("E", "R", self.normal_ladder(mu=120.0, strikes=(89.5, 99.5, 109.5, 119.5, 129.5)))])
+        self.assertEqual(e["below_zero"]["over_1c"], 0.5)
+
+    def test_a_ladder_with_no_tail_is_counted_and_left_out(self):
+        flat = [(t, 0.49, 0.51, False) for t in (29.5, 39.5, 49.5, 59.5)]
+        e = backtest.extrapolation([("E", "Q", flat), ("E", "R", self.normal_ladder())])
+        self.assertEqual((e["lowest"]["n"], e["lowest"]["no_tail"], e["highest"]["no_tail"], e["below_zero"]["n"]), (1, 1, 1, 1))
+        none = backtest.extrapolation([("E", "Q", flat)])
+        self.assertEqual((none["lowest"]["mean_abs_gap"], none["lowest"]["inside_quote"], none["below_zero"]["max"],
+                          none["below_zero"]["median"]), (None, None, None, None))
+        self.assertEqual(backtest.extrapolation([])["median_mid_at_lowest_strike"], None)
 
     def test_one_yard_sample_is_yards_100_to_397_ending_in_0_2_5_or_7(self):
         ms = [{"floor_strike": k - 0.5} for k in range(0, 601)] + [{"floor_strike": None}]

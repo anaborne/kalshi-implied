@@ -69,3 +69,11 @@ def parse_quote(bid, ask):
 def candles(series_ticker, ticker, start_ts, end_ts, period=60):
     return get(f"/series/{series_ticker}/markets/{ticker}/candlesticks",
                start_ts=int(start_ts), end_ts=int(end_ts), period_interval=period)["candlesticks"]
+
+
+def batch_candles(tickers, start_ts, end_ts, period=60):
+    """{ticker: candles} for many markets in one request. A market whose book did not change in
+    the window still gets one candle, stamped start_ts and carrying the book as it stood then."""
+    d = get("/markets/candlesticks", market_tickers=",".join(tickers), start_ts=int(start_ts), end_ts=int(end_ts),
+            period_interval=period, include_latest_before_start="true")
+    return {x["market_ticker"]: x.get("candlesticks") or [] for x in d["markets"]}
