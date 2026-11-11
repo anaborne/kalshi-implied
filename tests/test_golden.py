@@ -45,6 +45,15 @@ class TestGolden(unittest.TestCase):
     def test_nfl_backtest(self):
         self.assertEqual(run("backtest"), committed("backtest_passyds.json"))
 
+    def test_receiving_backtest(self):
+        self.assertEqual(run("backtest", "--series", "KXNFLRECYDS"), committed("backtest_recyds.json"))
+
+    def test_rushing_backtest(self):
+        self.assertEqual(run("backtest", "--series", "KXNFLRSHYDS"), committed("backtest_rshyds.json"))
+
+    def test_extrapolation(self):
+        self.assertEqual(run("extrapolate"), committed("extrapolation.json"))
+
     def test_one_yard(self):
         self.assertEqual(run("one-yard"), committed("one_yard_20261104.json"))
 
