@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -175,12 +176,39 @@ M = [
     ("implied/spx.py", "        if q0 is None or q1 is None:\n            continue", "        if q0 is None or q1 is None:\n            break"),
     ("implied/backtest.py", '        if m.get("strike_type") != "greater" or m.get("result") not in ("yes", "no"):', '        if m.get("result") not in ("yes", "no"):'),
     ("implied/__main__.py", 'won = next((m for m in settled if m["event_ticker"].startswith(prefix) and m.get("result") == "yes"), None)', 'won = next((m for m in settled if m.get("result") == "yes"), None)'),
+    ("implied/kalshi.py", 'period_interval=period, include_latest_before_start="true")', "period_interval=period)"),
+    ("implied/kalshi.py", 'x.get("candlesticks") or []', 'x["candlesticks"]'),
+    ("implied/backtest.py", 'cs[-1]["yes_bid"].get("close_dollars"), cs[-1]["yes_ask"].get("close_dollars"))', 'cs[0]["yes_bid"].get("close_dollars"), cs[0]["yes_ask"].get("close_dollars"))'),
+    ("implied/backtest.py", "snap - 2 * 3600, snap, period=1)", "snap - 2 * 3600, snap + 3600, period=1)"),
+    ("implied/backtest.py", "snap - 2 * 3600, snap, period=1)", "snap - 2 * 3600, snap, period=60)"),
+    ("implied/backtest.py", "def fetch_quotes(series, settled, per_request=40):", "def fetch_quotes(series, settled, per_request=100):"),
+    ("implied/backtest.py", "        by_snap.setdefault(int(snapshot_time(m).timestamp()), []).append(m)", "        by_snap.setdefault(0, []).append(m)"),
+    ("implied/backtest.py", "                    q = pregame_quote(series, m)", "                    q = (None, None)"),
+    ("implied/backtest.py", "                    searched.append(quote_key(m))\n", ""),
+    ("implied/__main__.py", "              if k not in searched and os.path.exists(", "              if os.path.exists("),
+    ("implied/backtest.py", "            q = (quotes or {}).get(quote_key(m))", "            q = None"),
+    ("implied/backtest.py", "bid, ask = q if q is not None else pregame_quote(series, m)", "bid, ask = q if q is not None and q[0] is not None else pregame_quote(series, m)"),
+    ("implied/backtest.py", "(rows[1:] if j == 0 else rows[:-1])]).point(t)", "rows]).point(t)"),
+    ("implied/backtest.py", '    for name, j in (("lowest", 0), ("highest", -1)):', '    for name, j in (("lowest", 0), ("highest", 0)):'),
+    ("implied/backtest.py", "                errs.append(p - (bid + ask) / 2)", "                errs.append((bid + ask) / 2 - p)"),
+    ("implied/backtest.py", '"no_tail": len(games) - len(errs),', '"no_tail": 0,'),
+    ("implied/backtest.py", "median([(rows[0][1] + rows[0][2]) / 2 for _, _, rows in games])", "median([(rows[-1][1] + rows[-1][2]) / 2 for _, _, rows in games])"),
+    ("implied/backtest.py", "in rows]).point(-0.5) for _, _, rows in games)", "in rows]).point(0.0) for _, _, rows in games)"),
+    ("implied/backtest.py", '"over_1c": mean([x > 0.01 for x in below])', '"over_1c": mean([x > 0.1 for x in below])'),
+    ("implied/__main__.py", '    quotes = quotes or (q and os.path.join(REPO, "data", q))\n', ""),
+    ("implied/__main__.py", "    recs = backtest.holdout(backtest.player_games(a.series, ms, quotes=quotes))", "    recs = backtest.holdout(backtest.player_games(a.series, ms, quotes=None))"),
+    ("implied/__main__.py", "        out[series] = backtest.extrapolation(backtest.player_games(series, ms, quotes=quotes))", "        out[series] = backtest.extrapolation(backtest.player_games(series, ms, quotes=None))"),
+    ("implied/__main__.py", "sum(quotes[k] == v for k, v in cached.items())", "len(cached)"),
+    ("implied/__main__.py", '"KXNFLRECYDS": ("recyds_settled_20261110.json", "recyds_quotes_20261110.json"),', '"KXNFLRECYDS": ("recyds_settled_20261110.json", "rshyds_quotes_20261110.json"),'),
+    ("implied/__main__.py", "not c.knots[0] <= a.range[0] - 0.5 <= a.range[1] + 0.5 <= c.knots[-1]:", "not c.knots[0] < a.range[0] - 0.5 <= a.range[1] + 0.5 <= c.knots[-1]:"),
+    ("implied/__main__.py", "not c.knots[0] <= a.range[0] - 0.5 <= a.range[1] + 0.5 <= c.knots[-1]:", "not c.knots[0] <= a.range[0] - 0.5 <= a.range[1] + 0.5 < c.knots[-1]:"),
 ]
 
 
-# A clean run of the suite takes about five seconds and well under 200 MB. macOS refuses
-# setrlimit memory caps, so a mutant that loops or allocates without end is watched and killed.
-LIMIT_SECONDS, LIMIT_RSS_KB = 120, 2 * 1024 * 1024
+# A clean run of the suite takes about 27 seconds alone and under 300 MB, most of both in the
+# golden backtests. macOS refuses setrlimit memory caps, so a mutant that loops or allocates
+# without end is watched and killed. Mutants run four at a time, so the time cap leaves room.
+LIMIT_SECONDS, LIMIT_RSS_KB, WORKERS = 300, 2 * 1024 * 1024, 4
 
 
 def run_capped(cmd, cwd):
@@ -200,42 +228,43 @@ def run_capped(cmd, cwd):
         return subprocess.CompletedProcess(cmd, p.returncode, out.read(), err.read())
 
 
+def attempt(mutation):
+    """(line to print, whether the mutation counts against the run)."""
+    path, old, new = mutation
+    with tempfile.TemporaryDirectory() as d:
+        dst = os.path.join(d, "r")
+        # A copy, not a link: a mutation can make the code write where it should only read.
+        shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        f = os.path.join(dst, path)
+        with open(f) as fh:
+            src = fh.read()
+        if src.count(old) != 1:
+            return f"PATTERN NOT FOUND ONCE  {path} | {old.strip()[:70]}", True
+        mutated = src.replace(old, new)
+        try:
+            compile(mutated, f, "exec")
+        except SyntaxError as e:
+            return f"MUTATION IS NOT VALID PYTHON  {path} | {e}", True
+        with open(f, "w") as fh:
+            fh.write(mutated)
+        # Stops at the first failure: one failing test is a kill, and most come before the golden runs.
+        r = run_capped([sys.executable, "-W", "error", "-m", "unittest", "discover", "-f", "-s", "tests", "-t", "."], dst)
+        first = old.strip().splitlines()[0][:70]
+        if r is None:
+            return f"killed (runaway)  {path} | {first}", False
+        if "Failed to import" in r.stderr or "ImportError" in r.stderr:
+            return f"MUTATION BREAKS IMPORT  {path} | {first}", True
+        killed = r.returncode != 0
+        return f"{'killed  ' if killed else 'SURVIVED'}  {path} | {first}", not killed
+
+
 def main():
-    bad = []
-    for path, old, new in M:
-        with tempfile.TemporaryDirectory() as d:
-            dst = os.path.join(d, "r")
-            # A copy, not a link: a mutation can make the code write where it should only read.
-            shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-            f = os.path.join(dst, path)
-            with open(f) as fh:
-                src = fh.read()
-            if src.count(old) != 1:
-                print(f"PATTERN NOT FOUND ONCE  {path} | {old.strip()[:70]}")
-                bad.append(old)
-                continue
-            mutated = src.replace(old, new)
-            try:
-                compile(mutated, f, "exec")
-            except SyntaxError as e:
-                print(f"MUTATION IS NOT VALID PYTHON  {path} | {e}")
-                bad.append(old)
-                continue
-            with open(f, "w") as fh:
-                fh.write(mutated)
-            r = run_capped([sys.executable, "-W", "error", "-m", "unittest", "discover", "-s", "tests", "-t", "."], dst)
-            if r is None:
-                print(f"killed (runaway)  {path} | {old.strip().splitlines()[0][:70]}")
-                continue
-            if "Failed to import" in r.stderr or "ImportError" in r.stderr:
-                print(f"MUTATION BREAKS IMPORT  {path} | {old.strip().splitlines()[0][:70]}")
-                bad.append(old)
-                continue
-            killed = r.returncode != 0
-            print(f"{'killed  ' if killed else 'SURVIVED'}  {path} | {old.strip().splitlines()[0][:70]}")
-            if not killed:
-                bad.append(old)
-    print(f"{len(M) - len(bad)} of {len(M)} mutations killed")
+    bad = 0
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for line, failed in pool.map(attempt, M):
+            print(line, flush=True)
+            bad += failed
+    print(f"{len(M) - bad} of {len(M)} mutations killed")
     sys.exit(1 if bad else 0)
 
 
