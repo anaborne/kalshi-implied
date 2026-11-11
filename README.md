@@ -12,7 +12,8 @@ Two products use it.
   a ladder every yard, 0+ to 601+, 602 markets per player. Ten minutes before kickoff, 2 of the
   2,047 one-yard books this repo sampled had a bid, and every ask was 99c (Results). A whole-yard
   range [a, b] is S(a - 0.5) - S(b + 0.5), where S(t) = P(yards > t); this prices it off the
-  25-yard ladder.
+  25-yard ladder. Receiving yards (KXNFLRECYDS) and rushing yards (KXNFLRSHYDS) are threshold
+  ladders as well, with two-sided strikes 5 to 15 yards apart, and the same curve reads them.
 - **S&P 500 close buckets.** Kalshi's rules settle KXINX on the end-of-day S&P 500 value. Cboe's
   specifications list SPXW options as P.M.-settled and trading to 16:00 ET on expiration day
   (13:00 on a half day). Vertical spreads on the SPXW options expiring that afternoon bound the
@@ -83,6 +84,71 @@ rest.
 
 Intervals are percentile bootstraps over 2,000 draws that resample whole games.
 
+### NFL: receiving and rushing yards, games Sep 9 to Nov 9 2026
+
+The same test on the receiving-yards and rushing-yards ladders: the same snapshot, the same
+four-strike minimum, the same bootstrap. Each series covers 136 games. Markets that settled
+neither Yes nor No and markets listed after the snapshot are left out, as above.
+
+| | Receiving (KXNFLRECYDS) | Rushing (KXNFLRSHYDS) |
+|---|---|---|
+| Settled markets | 15,157 | 7,789 |
+| Settled neither Yes nor No | 287 | 133 |
+| Listed after the snapshot | 1,423 | 699 |
+| Player-games | 1,573 | 772 |
+| Hidden interior strikes | 10,047 | 5,352 |
+| Curve: mean gap to the hidden book's mid | 0.82c (95% CI 0.79 to 0.85) | 0.87c (95% CI 0.84 to 0.92) |
+| Straight line: mean gap | 1.32c | 1.24c |
+| Curve closer than the line by | 0.50c (95% CI 0.46 to 0.54) | 0.37c (95% CI 0.35 to 0.39) |
+| Mean width of the hidden books | 1.61c | 1.48c |
+| Inside the hidden bid/ask: curve / line | 54.8% / 43.5% | 49.9% / 39.4% |
+| Brier score: curve / line / book's own mid | 0.16755 / 0.16758 / 0.16765 | 0.16731 / 0.16770 / 0.16729 |
+| Brier, curve minus book | -0.00009 (95% CI -0.00019 to +0.00002) | +0.00003 (95% CI -0.00014 to +0.00018) |
+
+- 2 receiving markets and 1 rushing market fall in both of the left-out rows, so the test reads
+  13,449 receiving and 6,958 rushing markets, the number of quotes in each shipped file.
+- Against the book, neither Brier difference is distinguishable from zero. As on passing yards,
+  the curve tracks the market's quotes and no edge is claimed.
+- Against the straight line, the curve's Brier score is lower on rushing by 0.00039 (95% CI
+  0.00008 to 0.00073). On receiving the two are not distinguishable: curve minus line is
+  -0.00003 (95% CI -0.00033 to +0.00029).
+- These ladders are finer than passing's, so the test interpolates across less. The two
+  neighbours of a hidden receiving strike are 20 yards apart on 6,442 strikes, 25 on 1,796, 10 on
+  1,233 and 15 on 576. On rushing they are 20 apart on 3,281, 10 on 1,504 and 15 on 567.
+- The pregame books of these two series were read through Kalshi's batch candlestick endpoint
+  (`fetch-quotes`), 40 markets to a request. Run on the 2,122 passing markets, whose books
+  were read one market at a time, it returns the identical quote for every one, with none
+  falling back to the single-market search.
+
+### NFL: outside the quoted strikes
+
+The hold-one-out test hides interior strikes only. Here the lowest and the highest two-sided
+strike of each ladder are hidden in turn and read off the tail fitted to the rest. Gaps are
+the estimate minus the hidden book's mid; "inside" is the share of ladders where the estimate
+fell within the hidden bid/ask. Passing covers games to Nov 2, the other two series to Nov 9.
+
+| | Passing | Receiving | Rushing |
+|---|---|---|---|
+| Ladders | 235 | 1,573 | 772 |
+| Lowest strike hidden: mean absolute gap | 1.10c | 5.04c | 4.30c |
+| Lowest strike hidden: mean signed gap | -0.11c | -4.99c | -4.21c |
+| Lowest strike hidden: inside | 40.0% | 4.1% | 4.3% |
+| Highest strike hidden: mean absolute gap | 0.94c | 1.27c | 1.45c |
+| Highest strike hidden: mean signed gap | -0.84c | -1.25c | -1.41c |
+| Highest strike hidden: inside | 45.1% | 39.5% | 31.0% |
+| Median mid at the lowest strike | 86.5c | 70.0c | 76.0c |
+| Fitted mass below zero yards: mean | 0.1% | 20.7% | 17.4% |
+| Fitted mass below zero yards: median / largest | 0.1% / 2.2% | 17.3% / 71.3% | 11.8% / 79.5% |
+
+- The tail reads low at the highest strike on all three series and at the lowest strike on
+  receiving and rushing, where it misses by 4c to 5c and lands inside the hidden bid/ask on
+  about 4% of ladders. At the lowest passing strike the signed gap is -0.11c.
+- On the median receiving ladder the lowest two-sided strike is quoted at 70c, so 30% of the
+  distribution sits below every quote; on rushing 24%, on passing 13.5%.
+- The lower tail is a normal, and nothing quoted constrains it below the lowest strike. Fitted
+  to a whole receiving or rushing ladder, it puts more than 1% below zero yards on every one.
+  On passing it does so on 2 of 235.
+
 ### NFL: Kalshi's one-yard books, Oct 29 to Nov 2 2026
 
 Of the 16,856 one-yard markets settled as of Nov 4 2026 (14 games, 28 players), 860 ever
@@ -136,22 +202,31 @@ with both a bid and an ask.
 ## Reproduce
 
 Every number in Results comes from a command in this repository, run on the data it ships with;
-the 16,856 and 860 above come from `one-yard`.
+the 16,856 and 860 above come from `one-yard`. Two exceptions: the 13,449 and 6,958 are the
+number of entries in the two shipped quote files, and `fetch-quotes` on the passing file, which
+goes online, prints the 2,122 of 2,122 agreement with the single-market cache.
 
 ```
 python3 -m implied backtest                                            # the hold-one-out table and intervals
+python3 -m implied backtest --series KXNFLRECYDS                       # the receiving column
+python3 -m implied backtest --series KXNFLRSHYDS                       # the rushing column
+python3 -m implied extrapolate                                         # outside the quoted strikes, all three series
 python3 -m implied one-yard                                            # the one-yard books
 python3 -m implied spx-day --snapshot data/snapshots/20261104 \
     --settled data/snapshots/20261104/settled-KXINX-26NOV04H1600.json  # the S&P table, close and flags
 python3 -m implied spx-day --snapshot data/snapshots/20261104 --keep-basis --clock book   # an alternative
 python3 -m implied fetch-settled --until 2026-11-04 --out /tmp/s.json  # regenerates the settled 25-yard file
 python3 -m implied fetch-settled --series KXNFLPASSYDSPRECISE --until 2026-11-05 --out /tmp/p.json   # and the one-yard file
+python3 -m implied fetch-settled --series KXNFLRECYDS --until 2026-11-11 --out /tmp/r.json   # the receiving file (KXNFLRSHYDS: rushing)
+python3 -m implied fetch-quotes --series KXNFLRECYDS --settled /tmp/r.json --out /tmp/q.json # and its pregame quotes
+python3 -m implied fetch-quotes --series KXNFLPASSYDS --settled data/passyds_settled_20261104.json --out /tmp/c.json   # the 2,122 check
 ```
 
 Live use:
 
 ```
 python3 -m implied nfl KXNFLPASSYDS-26NOV08CLENO --player "Tyler Shough" --range 250 300
+python3 -m implied nfl KXNFLRECYDS-26NOV12WASNYG --player "Darnell Mooney" --range 40 59
 python3 -m implied spx                                                 # during market hours
 python3 -m implied record                                              # snapshots to the KXINX close
 python3 -m implied trim --snapshot data/snapshots/YYYYMMDD             # keeps the same-day SPXW legs
@@ -159,13 +234,14 @@ python3 -m implied trim --snapshot data/snapshots/YYYYMMDD             # keeps t
 
 ## Verification
 
-- 190 unit tests, run with warnings as errors: `python3 -W error -m unittest discover -s tests -t .`
-  Three of them rerun `backtest`, `one-yard` and `spx-day` offline on the shipped data and require
-  byte-equal output with the committed result files.
+- 213 unit tests, run with warnings as errors: `python3 -W error -m unittest discover -s tests -t .`
+  Six of them rerun `backtest` on each of the three series, `extrapolate`, `one-yard` and
+  `spx-day` offline on the shipped data and require byte-equal output with the committed result
+  files.
 - `python3 mutation_check.py` plants specific bugs one at a time (wrong fee rounding, an
   off-by-one strike, a look-ahead snapshot, a stale spot or clock, a stale forward basis, dropped
-  weights, and others) and exits 1 unless the suite fails on every one, with each mutation
-  compiling and importing.
+  weights, a batch read past the snapshot, a hidden strike left in the fit, and others) and exits
+  1 unless the suite fails on every one, with each mutation compiling and importing.
 - Every line in `implied/` runs under the tests except the `if __name__ == "__main__"` guard.
 
 ## Scope
@@ -175,6 +251,22 @@ python3 -m implied trim --snapshot data/snapshots/YYYYMMDD             # keeps t
   and read one page of up to 500 KXINX markets; all 60 open markets fit on that page. The
   Kalshi and Yahoo files are the raw responses; the Cboe chains are the raw responses cut by
   `trim` to the same-day SPXW legs, the only ones replay reads.
+- A range is supported between a player's lowest and highest two-sided strikes, which is what
+  the hold-one-out tests cover. Outside them the fair value is a fitted normal tail, and
+  "outside the quoted strikes" shows it reading low, by 4c to 5c at the lowest receiving or
+  rushing strike. The forced bounds still hold there; the fair value should not be quoted, and
+  `nfl --range` marks any range that reaches outside.
+- A receiving or rushing range that starts at 0 is the worst case of that. The tail puts 20.7%
+  (receiving) and 17.4% (rushing) of the mass below zero on average, and S(-0.5) - S(b + 0.5)
+  leaves all of it out. "b yards or fewer", 1 - S(b + 0.5) with b + 0.5 inside the quoted
+  strikes, does not touch the tail. It also pays on a total below zero, which happens,
+  mostly on rushing, so it is a different contract from 0 to b and not a repair of it.
+- Receiving and rushing pregame quotes ship as one file per series
+  (`data/recyds_quotes_20261110.json`, `data/rshyds_quotes_20261110.json`), keyed the way the
+  one-file-per-market passing cache in `data/nfl` is named. The settled files are Kalshi's raw
+  responses. A refetch later on Nov 10 returned the same markets with the same results; only
+  the rolling 24-hour fields (`volume_24h_fp` and the three `previous_*` prices) differed, and
+  nothing here reads them.
 - The one-yard result is one week of games, sampled at 120 of each player's 602 yards.
 - Kalshi taker fees are modelled as 7% times the series' published multiplier, times
   C x P x (1 - P), rounded up to the cent per order, on the displayed size. The API gives KXINX
